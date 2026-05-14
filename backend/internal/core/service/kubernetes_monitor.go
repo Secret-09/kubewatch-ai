@@ -4,22 +4,23 @@ import (
     "context"
     "fmt"
     "strings"
-    "time"
 
     appsv1 "k8s.io/api/apps/v1"
     corev1 "k8s.io/api/core/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+    "kubewatch-ai/internal/core/analysis"
     "kubewatch-ai/internal/core/model"
     "kubewatch-ai/internal/infrastructure/k8s"
 )
 
 type KubernetesMonitor struct {
-    client *k8s.Client
+    client   *k8s.Client
+    analyzer *analysis.IncidentAnalyzer
 }
 
 func NewKubernetesMonitor(client *k8s.Client) *KubernetesMonitor {
-    return &KubernetesMonitor{client: client}
+    return &KubernetesMonitor{client: client, analyzer: analysis.NewIncidentAnalyzer()}
 }
 
 func (m *KubernetesMonitor) ListNamespaces(ctx context.Context) ([]string, error) {
@@ -118,20 +119,8 @@ func (m *KubernetesMonitor) DetectDeploymentReplicaMismatches(ctx context.Contex
 func (m *KubernetesMonitor) buildCrashLoopIncident(pod corev1.Pod) *model.Incident {
     for _, status := range pod.Status.ContainerStatuses {
         if status.State.Waiting != nil && strings.Contains(status.State.Waiting.Reason, "CrashLoopBackOff") {
-            return &model.Incident{
-                ID:                  fmt.Sprintf("pod-%s-%s", pod.Namespace, pod.Name),
-                Namespace:           pod.Namespace,
-                Workload:            pod.Name,
-                Type:                "CrashLoopBackOff",
-                Summary:             "Pod is stuck in CrashLoopBackOff",
-                Details:             fmt.Sprintf("container=%s reason=%s message=%s", status.Name, status.State.Waiting.Reason, status.State.Waiting.Message),
-                Severity:            model.SeverityHigh,
-                SeverityScore:       85,
-                SuggestedRemediation: "Inspect pod logs and restart the container after fixing the crash loop.",
-                FirstSeen:           time.Now(),
-                LastSeen:            time.Now(),
-                Source:              "kubernetes-monitor",
-            }
+            incident := m.analyzer.AnalyzeCrashLoopBackOff(pod.Name, pod.Namespace, status.Name, status.State.Waiting.Reason, status.State.Waiting.Message, status.RestartCount)
+            return &incident
         }
     }
     return nil
@@ -139,57 +128,22 @@ func (m *KubernetesMonitor) buildCrashLoopIncident(pod corev1.Pod) *model.Incide
 
 func (m *KubernetesMonitor) buildUnhealthyPodIncident(pod corev1.Pod) *model.Incident {
     if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown {
-        return &model.Incident{
-            ID:                  fmt.Sprintf("pod-%s-%s", pod.Namespace, pod.Name),
-            Namespace:           pod.Namespace,
-            Workload:            pod.Name,
-            Type:                "UnhealthyPod",
-            Summary:             "Pod is not healthy",
-            Details:             fmt.Sprintf("phase=%s ready=%t restartCount=%d", pod.Status.Phase, isPodReady(pod), totalRestartCount(pod)),
-            Severity:            model.SeverityHigh,
-            SeverityScore:       70,
-            SuggestedRemediation: "Evaluate container readiness and pod conditions to restore pod health.",
-            FirstSeen:           time.Now(),
-            LastSeen:            time.Now(),
-            Source:              "kubernetes-monitor",
-        }
+        incident := m.analyzer.AnalyzeUnhealthyPod(pod.Name, pod.Namespace, fmt.Sprintf("phase=%s ready=%t restartCount=%d", pod.Status.Phase, isPodReady(pod), totalRestartCount(pod)))
+        return &incident
     }
 
     if !isPodReady(pod) {
-        return &model.Incident{
-            ID:                  fmt.Sprintf("pod-%s-%s", pod.Namespace, pod.Name),
-            Namespace:           pod.Namespace,
-            Workload:            pod.Name,
-            Type:                "UnhealthyPod",
-            Summary:             "Pod readiness check failed",
-            Details:             fmt.Sprintf("ready=%t restartCount=%d", isPodReady(pod), totalRestartCount(pod)),
-            Severity:            model.SeverityMedium,
-            SeverityScore:       55,
-            SuggestedRemediation: "Review pod conditions and health checks to restore readiness.",
-            FirstSeen:           time.Now(),
-            LastSeen:            time.Now(),
-            Source:              "kubernetes-monitor",
-        }
+        incident := m.analyzer.AnalyzeHighRestartCount(pod.Name, pod.Namespace, totalRestartCount(pod))
+        return &incident
     }
     return nil
 }
 
 func (m *KubernetesMonitor) buildDeploymentReplicaIncident(deploy appsv1.Deployment) *model.Incident {
     if deploy.Status.ReadyReplicas < deploy.Status.Replicas {
-        return &model.Incident{
-            ID:                  fmt.Sprintf("deployment-%s-%s", deploy.Namespace, deploy.Name),
-            Namespace:           deploy.Namespace,
-            Workload:            deploy.Name,
-            Type:                "DeploymentReplicaMismatch",
-            Summary:             "Deployment replica mismatch detected",
-            Details:             fmt.Sprintf("desired=%d ready=%d available=%d", deploy.Status.Replicas, deploy.Status.ReadyReplicas, deploy.Status.AvailableReplicas),
-            Severity:            model.SeverityMedium,
-            SeverityScore:       60,
-            SuggestedRemediation: "Inspect deployment status and adjust replica configuration or pod health checks.",
-            FirstSeen:           time.Now(),
-            LastSeen:            time.Now(),
-            Source:              "kubernetes-monitor",
-        }
+        details := fmt.Sprintf("desired=%d ready=%d available=%d", deploy.Status.Replicas, deploy.Status.ReadyReplicas, deploy.Status.AvailableReplicas)
+        incident := m.analyzer.AnalyzeUnhealthyDeployment(deploy.Name, deploy.Namespace, details)
+        return &incident
     }
     return nil
 }
